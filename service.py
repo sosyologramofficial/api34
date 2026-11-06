@@ -2159,6 +2159,7 @@ def signup(email: str, password: str, lang: str = "enu", country: str = "US"):
     }
     payload, aes_key = create_member_auth_payload(user_data)
     res = requests.post(SIGNUP_URL, json=payload, headers=MEMBER_HEADERS, timeout=30)
+    print(f"[DEBUG SIGNUP] HTTP {res.status_code} | Yanit: {repr(res.text[:500])}")
     res.raise_for_status()
     body = res.json()
     if body.get("status") == "SUCCESS" and "info" in body:
@@ -3428,6 +3429,17 @@ def generate_ai_video_service(
 ACTIVE_ACCOUNTS = {} # {api_key_id: {"email": email, "password": password, "member_token": token, "timestamp": time.time()}}
 ACCOUNT_LOCK = threading.Lock()
 
+# Her API anahtari icin hesap acma surecini kilitleyen mekanizma
+ACCOUNT_CREATION_LOCKS = {}
+CREATION_LOCK_MUTEX = threading.Lock()
+
+def get_creation_lock(api_key_id):
+    """Her api_key_id icin ozel bir hesap acma kilidi doner."""
+    with CREATION_LOCK_MUTEX:
+        if api_key_id not in ACCOUNT_CREATION_LOCKS:
+            ACCOUNT_CREATION_LOCKS[api_key_id] = threading.Lock()
+        return ACCOUNT_CREATION_LOCKS[api_key_id]
+
 def mark_account_exhausted(api_key_id, email):
     """Marks an account as used=1 (credits exhausted) in the database and removes it from active cache."""
     with ACCOUNT_LOCK:
@@ -3495,7 +3507,9 @@ def create_myedit_account(api_key_id):
 
         return member_token, email
     except Exception as e:
+        import traceback
         print(f"[-] Account creation exception: {e}")
+        traceback.print_exc()
         return None, None
 
 def create_myedit_account_wrapper(api_key_id):
@@ -3527,12 +3541,12 @@ def get_or_create_active_account(api_key_id, task_id=None, force_new=False):
     # 2. Check if DB has the most recently created valid account (ORDER BY id DESC)
     if not force_new:
         try:
-            query = 'SELECT email, password FROM accounts WHERE api_key_id = %s ORDER BY id DESC LIMIT 1' if db.DB_TYPE == 'postgresql' else 'SELECT email, password FROM accounts WHERE api_key_id = ? ORDER BY id DESC LIMIT 1'
+            query = 'SELECT email, password FROM accounts WHERE api_key_id = %s AND used = 0 ORDER BY id DESC LIMIT 1' if db.DB_TYPE == 'postgresql' else 'SELECT email, password FROM accounts WHERE api_key_id = ? AND used = 0 ORDER BY id DESC LIMIT 1'
             db_acc = db._execute_query(query, (api_key_id,), fetch_one=True)
             if db_acc and db_acc.get("email") and db_acc.get("password"):
                 email = db_acc["email"]
                 password = db_acc["password"]
-                print(f"[ACCOUNT] Found latest account in DB: {email}. Attempting login...")
+                print(f"[ACCOUNT] Found valid account in DB: {email}. Attempting login...")
                 login_res = login(email, password)
                 if login_res.get("status") == "SUCCESS" and "info" in login_res:
                     member_token = login_res["info"].get("memberToken")
@@ -3559,30 +3573,57 @@ def get_or_create_active_account(api_key_id, task_id=None, force_new=False):
         except Exception as e:
             print(f"[ACCOUNT] Error retrieving DB account: {e}")
 
-    # 3. Create a fresh account via temp-mail
-    for attempt in range(5):
-        print(f"[ACCOUNT] Registering new account for api_key_id={api_key_id} (attempt {attempt+1}/5)...")
-        member_token, email = create_myedit_account_wrapper(api_key_id)
-        if member_token and email:
-            password = "CyberLink123!"
-            acc_data = {
-                "email": email,
-                "password": password,
-                "member_token": member_token,
-                "timestamp": time.time()
-            }
-            with ACCOUNT_LOCK:
-                ACTIVE_ACCOUNTS[api_key_id] = acc_data
+    # 3. Create a fresh account via temp-mail (kilitli ve beklemeli)
+    creation_lock = get_creation_lock(api_key_id)
+    with creation_lock:
+        # DOUBLE-CHECK: Bekleyen diger istekler icin kontrol
+        is_waiting_request = False
+        acc = None
+        with ACCOUNT_LOCK:
+            if api_key_id in ACTIVE_ACCOUNTS:
+                candidate = ACTIVE_ACCOUNTS[api_key_id]
+                if candidate.get("member_token") and candidate.get("email"):
+                    acc = candidate
+                    is_waiting_request = True
+
+        # Sirada bekleyen istekler icin 1 dakika aralik koyma
+        if is_waiting_request and acc:
+            print(f"[ACCOUNT] Sirada bekleyen istek uyandi. 1 dakika aralik icin 60 saniye bekleniyor...")
+            time.sleep(60)
             if task_id:
                 try:
                     if db.DB_TYPE == 'postgresql':
-                        db._execute_query('UPDATE tasks SET account_email = %s WHERE task_id = %s', (email, task_id))
+                        db._execute_query('UPDATE tasks SET account_email = %s WHERE task_id = %s', (acc['email'], task_id))
                     else:
-                        db._execute_query('UPDATE tasks SET account_email = ? WHERE task_id = ?', (email, task_id))
+                        db._execute_query('UPDATE tasks SET account_email = ? WHERE task_id = ?', (acc['email'], task_id))
                 except Exception:
                     pass
-            return member_token, acc_data
-        time.sleep(2)
+            return acc["member_token"], acc
+
+        # Sadece sirada 1. olan istek temp-mail ile yeni hesap acar
+        for attempt in range(5):
+            print(f"[ACCOUNT] Registering new account for api_key_id={api_key_id} (attempt {attempt+1}/5)...")
+            member_token, email = create_myedit_account_wrapper(api_key_id)
+            if member_token and email:
+                password = "CyberLink123!"
+                acc_data = {
+                    "email": email,
+                    "password": password,
+                    "member_token": member_token,
+                    "timestamp": time.time()
+                }
+                with ACCOUNT_LOCK:
+                    ACTIVE_ACCOUNTS[api_key_id] = acc_data
+                if task_id:
+                    try:
+                        if db.DB_TYPE == 'postgresql':
+                            db._execute_query('UPDATE tasks SET account_email = %s WHERE task_id = %s', (email, task_id))
+                        else:
+                            db._execute_query('UPDATE tasks SET account_email = ? WHERE task_id = ?', (email, task_id))
+                    except Exception:
+                        pass
+                return member_token, acc_data
+            time.sleep(2)
 
     return None, None
 
